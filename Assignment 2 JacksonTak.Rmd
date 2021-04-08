@@ -1,0 +1,615 @@
+---
+title: 'Assignment 2'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r}
+# SEE model data package for new datasets
+library(ranger)
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(stacks)            # for stacking models
+library(naniar)            # for examining missing values (NAs)
+library(lubridate)         # for date manipulation
+library(moderndive)        # for King County housing data
+library(vip)               # for variable importance plots
+library(DALEX)             # for model interpretation  
+library(DALEXtra)          # for extension of DALEX
+library(patchwork)         # for combining plots nicely
+library(kknn)
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+data("lending_club")
+# Data dictionary (as close as I could find): https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691
+```
+
+
+When you finish the assignment, remove the `#` from the options chunk at the top, so that messages and warnings aren't printed. If you are getting errors in your code, add `error = TRUE` so that the file knits. I would recommend not removing the `#` until you are completely finished.
+
+## Put it on GitHub!        
+
+From now on, GitHub should be part of your routine when doing assignments. I recommend making it part of your process anytime you are working in R, but I'll make you show it's part of your process for assignments.
+
+**Task**: When you are finished with the assignment, post a link below to the GitHub repo for the assignment. If you want to post it to your personal website, that's ok (not required). Make sure the link goes to a spot in the repo where I can easily find this assignment. For example, if you have a website with a blog and post the assignment as a blog post, link to the post's folder in the repo. As an example, I've linked to my GitHub stacking material [here](https://github.com/llendway/ads_website/tree/master/_posts/2021-03-22-stacking).
+
+## Modeling
+
+Before jumping into these problems, you should read through (and follow along with!) the [model stacking](https://advanced-ds-in-r.netlify.app/posts/2021-03-22-stacking/) and [global model interpretation](https://advanced-ds-in-r.netlify.app/posts/2021-03-24-imlglobal/) tutorials on the Course Materials tab of the course website.
+
+We'll be using the `lending_club` dataset from the `modeldata` library, which is part of `tidymodels`. The data dictionary they reference doesn't seem to exist anymore, but it seems the one on this [kaggle discussion](https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691) is pretty close. It might also help to read a bit about [Lending Club](https://en.wikipedia.org/wiki/LendingClub) before starting in on the exercises.
+
+The outcome we are interested in predicting is `Class`. And according to the dataset's help page, its values are "either 'good' (meaning that the loan was fully paid back or currently on-time) or 'bad' (charged off, defaulted, of 21-120 days late)".
+
+**Tasks:** I will be expanding these, but this gives a good outline.
+
+*1. Explore the data, concentrating on examining distributions of variables and examining missing values.* 
+
+```{r}
+# quantitative variables distributions
+lending_club %>% 
+  select(where(is.numeric)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(vars(variable), 
+             scales = "free")
+```
+
+Based on the distribution plots above, we find that a lot of variables are heavily right-skewed. This suggests that we will have to log the variables instead of just interpreting the variables themselves. We also find some outliers in `annual_inc` and `int_rate` variables. 
+
+
+```{r}
+# Categorical variables 
+lending_club %>% 
+  select(where(is.factor)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_bar() +
+  facet_wrap(vars(variable), 
+             scales = "free")
+```
+
+For the categorical variables, we see that a lot of observations come from certain states than the others. We also find that there are much more good observations in `class` than the other. For the `emp_length` variable, there is one outlier as we see from the plot. 
+
+
+```{r}
+# examination of missing variables
+lending_club %>% 
+  add_n_miss() %>% 
+  count(n_miss_all)
+
+colSums(is.na(lending_club))
+```
+
+There seems to be no missing variables in our data set. 
+
+
+*2. Do any data cleaning steps that need to happen before the model is build. For example, you might remove any variables that mean the same thing as the response variable (not sure if that happens here), get rid of rows where all variables have missing values, etc.* 
+
+Be sure to add more "bad" Classes. This is not the best solution, but it will work for now. (Should investigate how to appropriately use `step_sample_up()` function from [`themis`](https://github.com/tidymodels/themis)).
+
+```{r}
+create_more_bad <- lending_club %>% 
+  filter(Class == "bad") %>% 
+  sample_n(size = 3000, replace = TRUE)
+
+lending_club_mod <- lending_club %>% 
+  bind_rows(create_more_bad) %>% 
+  # remove zero variance and near zero variance
+  select(-delinq_amnt, -acc_now_delinq)
+```
+
+
+
+3. Split the data into training and test, putting 75\% in the training data.
+
+```{r}
+set.seed(494) # for reproducibility
+
+# split the data into training and test
+lc_split <- initial_split(lending_club_mod, 
+                             prop = .75)
+lc_training <- training(lc_split)
+lc_testing <- testing(lc_split)
+```
+
+*4. Set up the recipe and the pre-processing steps to build a lasso model. Some steps you should take:*
+
+* Make all integer variables numeric (I'd highly recommend using `step_mutate_at()` or this will be a lot of code). We'll want to do this for the model interpretation we'll do later.  
+* Think about grouping factor variables with many levels.  
+* Make categorical variables dummy variables (make sure NOT to do this to the outcome variable).  
+* Normalize quantitative variables.  
+
+```{r}
+lc_recipe <- recipe(Class ~ ., 
+                    data = lc_training) %>% 
+  
+  # make all variables numeric
+  step_mutate_at(all_numeric(), fn = ~as.numeric(.)) %>%
+  
+  # Group factor variables with many levels: there aren't any  
+  
+  # normalise quantitative variables
+  # make all categorical into dummy variables
+  step_dummy(all_nominal(),-all_outcomes()) %>% 
+  step_normalize(all_predictors(), 
+                 -all_nominal(), 
+                 -has_role(match = "evaluative")) 
+```
+
+```{r}
+lc_recipe %>% 
+    prep(lc_training) %>%
+    juice()
+```
+
+
+*5. Set up the lasso model and workflow. We will tune the `penalty` parameter.*
+
+```{r}
+# Set up LASSO Model
+LC_lasso_mod <- 
+  logistic_reg(mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_args(penalty = tune()) %>% 
+  set_mode("classification")
+```
+
+```{r}
+# Set up work flow
+LC_lasso_wf <- 
+  workflow() %>% 
+  add_recipe(lc_recipe) %>% 
+  add_model(LC_lasso_mod)
+```
+
+
+
+*6. Set up the model tuning for the `penalty` parameter. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Find the accuracy and area under the roc curve for the model with the best tuning parameter.  Use 5-fold cv.*
+
+```{r}
+set.seed(494) #for reproducible 5-fold
+
+lending_cv <- vfold_cv(lc_training, v = 5)
+
+# set penalty grid
+penalty_grid <- grid_regular(penalty(),
+                             levels = 10)
+
+# add control grid by using the control_stack_grid function 
+ctrl_grid <- control_stack_grid()
+
+# metric set up 
+# metric <- metric_set(accuracy)
+
+# set up the model tuning for the penalty parameter
+LC_lasso_tune <- 
+  LC_lasso_wf %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = penalty_grid,
+#    metrics = metric,
+    control = ctrl_grid
+    )
+```
+
+```{r}
+# choose the best tuning parameter 
+best_param <- LC_lasso_tune %>% 
+  select_best(metric = "accuracy")
+
+# finalise workflow
+LC_lasso_final_wf <- LC_lasso_wf %>% 
+  finalize_workflow(best_param)
+
+# fit final model
+LC_lasso_final_mod <- LC_lasso_final_wf %>% 
+  fit(data = lc_training)
+```
+
+```{r}
+LC_lasso_test <- LC_lasso_final_mod %>% 
+  last_fit(lc_split)
+
+LC_lasso_test %>% 
+  collect_metrics()
+```
+
+- The estimate for accuracy: 0.7548227
+
+- The area under the ROC curve: 0.7655311 
+
+
+
+*7. Set up the recipe and the pre-processing steps to build a random forest model. You shouldn't have to do as many steps. The only step you should need to do is making all integers numeric.*
+
+```{r}
+# set up random forest recipe
+lc_recipe_2 <- recipe(Class ~ ., 
+                    data = lc_training) %>% 
+  
+  # make all variables numeric
+  step_mutate_at(all_numeric(), fn = ~as.numeric(.))
+```
+
+
+*8. Set up the random forest model and workflow. We will tune the `mtry` and `min_n` parameters and set the number of trees, `trees`, to 100 (otherwise the next steps take too long).*
+
+```{r}
+# define rf model
+lc_rf <-   rand_forest(mtry = tune(), 
+                         min_n = tune(), 
+                         trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+# set workflow 
+lc_rf_workflow <- 
+  workflow() %>% 
+  add_recipe(lc_recipe_2) %>% 
+  add_model(lc_rf) 
+```
+
+
+*9. Set up the model tuning for both the `mtry` and `min_n` parameters. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Use only 3 levels in the grid. For the `mtry` parameter, you need to put `finalize(mtry(), lending_training %>% select(-Class))` in as an argument instead of just `mtry()`, where `lending_training` is the name of your training data. This is because the `mtry()` grid will otherwise have unknowns in it. This part can take a while to run.*
+
+```{r}
+# penalty grid for rf
+rf_penalty_grid <- grid_regular(finalize(mtry(), lc_training %>% 
+    select(-Class)), min_n(), levels = 3)
+
+# set up the model tuning for the penalty parameter
+LC_rf_tune <- 
+  lc_rf_workflow %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = rf_penalty_grid,
+#    metrics = metric,
+    control = ctrl_grid
+    )
+```
+
+
+*10. Find the best tuning parameters. What is the are the accuracy and area under the ROC curve for the model with those tuning parameters?*
+
+```{r}
+# choose the best tuning parameter 
+best_param <- LC_rf_tune %>% 
+  select_best(metric = "accuracy")
+
+# finalise workflow
+LC_rf_final_wf <- lc_rf_workflow %>% 
+  finalize_workflow(best_param)
+
+# fit final model
+LC_rf_final_mod <- LC_rf_final_wf %>% 
+  fit(data = lc_training)
+```
+
+```{r}
+LC_rf_test <- LC_rf_final_mod %>% 
+  last_fit(lc_split)
+
+LC_rf_test %>% 
+  collect_metrics()
+```
+
+- Accuracy: 0.9968886
+
+- Area under the ROC curve: 0.9999838
+
+
+*11. Use functions from the `DALEX` and `DALEXtra` libraries to create a histogram and boxplot of the residuals from the training data. How do they look? Any interesting behavior?*
+
+```{r}
+# lasso model explainer 
+lasso_explain <- 
+  explain_tidymodels(
+    model = LC_lasso_final_mod,
+    data = lc_training %>% select(-Class), 
+    y = as.numeric(lc_training %>% pull(Class)),
+    label = "lasso"
+  )
+
+
+# random forest explainer
+rf_explain <- 
+  explain_tidymodels(
+    model = LC_rf_final_mod,
+    data = lc_training %>% select(-Class), 
+    y = as.numeric(lc_training %>% pull(Class)),
+    label = "rf"
+  )
+```
+
+```{r}
+lasso_mod_perf <- model_performance(lasso_explain)
+rf_mod_perf <-  model_performance(rf_explain)
+```
+
+```{r}
+# lasso performance 
+lasso_mod_perf  
+
+# random forest performance
+rf_mod_perf
+```
+```{r}
+hist_plot <- 
+  plot(lasso_mod_perf,
+       rf_mod_perf, 
+       geom = "histogram")
+
+box_plot <-
+  plot(lasso_mod_perf,
+       rf_mod_perf, 
+       geom = "boxplot")
+
+hist_plot + box_plot
+```
+
+Based on the visualisations above, we find that most of the residual observations from the training data are 1. [Explain more]  
+
+
+*12. Use `DALEX` functions to create a variable importance plot from this model. What are the most important variables?* 
+
+```{r}
+set.seed(494) #since we are sampling & permuting, we set a seed so we can replicate the results
+
+# Lasso variable importance 
+lasso_var_imp <- 
+  model_parts(
+    lasso_explain
+    )
+
+plot(lasso_var_imp, show_boxplots = TRUE)
+```
+
+```{r}
+set.seed(494)
+
+# rf important variables
+rf_var_imp <- 
+  model_parts(
+    rf_explain
+    )
+
+plot(rf_var_imp, show_boxplots = TRUE)
+```
+
+
+*13. Write a function called `cp_profile` to make a CP profile. The function will take an explainer, a new observation, and a variable name as its arguments and create a CP profile for a quantitative predictor variable. You will need to use the `predict_profile()` function inside the function you create - put the variable name there so the plotting part is easier. You'll also want to use `aes_string()` rather than `aes()` and quote the variables. Use the `cp_profile()` function to create one CP profile of your choosing. Be sure to choose a variable that is numeric, not integer. There seem to be issues with those that I'm looking into.*
+
+*For an extra challenge, write a function that will work for either a quantitative or categorical variable.* 
+
+*If you need help with function writing check out the [Functions](https://r4ds.had.co.nz/functions.html) chapter of R4DS by Wickham and Grolemund.*
+
+
+```{r}
+cp_profile <- function(explainer, obs, var) {
+  predprof <- predict_profile(explainer = explainer,
+                             new_observation = obs, 
+                             variable = var) %>%
+    rename(yhat = `_yhat_`) %>%
+    ggplot(aes_string(x = var, y = "yhat")) +
+           geom_line() 
+} 
+
+# observation 
+obs4 <- lc_training %>% 
+  slice(4)
+
+# for LASSO
+cp_profile(lasso_explain, obs4, "int_rate")
+
+# for RF
+cp_profile(rf_explain, obs4, "int_rate")
+```
+
+
+
+
+*14. Use `DALEX` functions to create partial dependence plots (with the CP profiles in gray) for the 3-4 most important variables. If the important variables are categorical, you can instead make a CP profile for 3 observations in the dataset and discuss how you could go about constructing a partial dependence plot for a categorical variable (you don't have to code it, but you can if you want an extra challenge). If it ever gives you an error that says, "Error: Can't convert from `VARIABLE` <double> to `VARIABLE` <integer> due to loss of precision", then remove that variable from the list. I seem to have figured out why it's doing that, but I don't know how to fix it yet.*
+
+```{r}
+set.seed(494)
+
+# For LASSO
+partdepLASSO <- model_profile(explainer = lasso_explain, variables = c("addr_state", "int_rate", "open_il_12m"))
+
+plot(partdepLASSO, 
+     geom = "profiles")
+
+# For RF 
+partdepRF <- model_profile(explainer = rf_explain, variables = c("open_il_12m", "int_rate", "revol_util"))
+
+plot(partdepRF, 
+     geom = "profiles")
+
+```
+
+
+*15. Fit one more model type of your choosing that will feed into the stacking model.*
+
+```{r}
+# KNN model 
+knn <-
+  nearest_neighbor(
+    neighbors = tune("k")
+  ) %>%
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+# create the workflow
+knn_wf <- 
+  workflow() %>% 
+  add_model(knn) %>%
+  add_recipe(lc_recipe)
+
+# tune it using 4 tuning parameters
+knn_tune <- 
+  knn_wf %>% 
+  tune_grid(
+    lending_cv,
+#    metrics = metric,
+    grid = 4,
+    control = control_stack_grid()
+  )
+```
+
+
+**16. Create a model stack with the candidate models from the previous parts of the exercise and use the `blend_predictions()` function to find the coefficients of the stacked model. Create a plot examining the performance metrics for the different penalty parameters to assure you have captured the best one. If not, adjust the penalty. (HINT: use the `autoplot()` function). Which models are contributing most?**
+
+```{r}
+LC_stack <- 
+  stacks() %>% 
+  add_candidates(LC_rf_tune) %>% 
+  add_candidates(LC_lasso_tune) %>% 
+  add_candidates(knn_tune)
+```
+
+```{r}
+LC_blend <- 
+  LC_stack%>% 
+  blend_predictions() 
+
+autoplot(LC_blend)
+```
+
+
+17. Fit the final stacked model using `fit_members()`. Apply the model to the test data and report the accuracy and area under the curve. Create a graph of the ROC and construct a confusion matrix. Comment on what you see. Save this final model using the `saveRDS()` function - see the [Use the model](https://advanced-ds-in-r.netlify.app/posts/2021-03-16-ml-review/#use-the-model) section of the `tidymodels` intro. We are going to use the model in the next part. You'll want to save it in the folder where you create your shiny app.
+
+
+```{r}
+# fit final stacked model 
+LC_final_stacked <- LC_blend %>% 
+  fit_members()
+```
+
+```{r}
+# apply to the test data
+LC_final_stacked %>% 
+  predict(new_data = lc_testing) %>% 
+  bind_cols(lc_testing)
+```
+
+```{r}
+autoplot(LC_final_stacked)
+```
+
+
+## Shiny app
+
+If you are new to Shiny apps or it's been awhile since you've made one, visit the Shiny links on our course [Resource](https://advanced-ds-in-r.netlify.app/resources.html) page. I would recommend starting with my resource because it will be the most basic. You won't be doing anything super fancy in this app. 
+
+Everyone should watch the [Theming Shiny](https://youtu.be/b9WWNO4P2nY) talk by Carson Sievert so you can make your app look amazing.
+
+**Tasks:**
+
+You are going to create an app that allows a user to explore how the predicted probability of a loan being paid back (or maybe just the predicted class - either "good" or "bad") changes depending on the values of the predictor variables.
+
+Specifically, you will do the following:
+
+* Set up a separate project and GitHub repo for this app. Make sure the saved model from the previous problem is also in that folder. The app needs to be created in a file called *exactly* app.R that is also in the project folder.   
+* At the top of the file, load any libraries you use in the app.  
+* Use the `readRDS()` function to load the model.  
+* You may want to load some of the data to use
+* Create a user interface (using the various `*Input()` functions) where someone could enter values for each variable that feeds into the model. You will want to think hard about which types of `*Input()` functions to use. Think about how you can best prevent mistakes (eg. entering free text could lead to many mistakes). 
+* Another part of the user interface will allow them to choose a variable (you can limit this to only the quantitative variables) where they can explore the effects of changing that variable, holding all others constant.  
+* After the user has entered all the required values, the output will be a CP profile with the the predicted value for the data that was entered, indicated by a point. I don't think the functions from `DALEX` and `DALEXtra` will work with a stacked model, so you'll likely have to (get to) do some of your own coding. 
+* Use the `bslib` to theme your shiny app!  
+* Publish your app to [shinyapps.io](https://www.shinyapps.io/). There are instructions for doing that on the tutorial I linked to above.   
+* Write a paragraph or two describing your app on your website! Link to the app and your GitHub repository in your post. Include a link to your post here. 
+
+
+*For this question, Lisa told us that we could just have an outline of how we would approach different parts in the shinyapp. Please find the general outline below:*
+
+# outline 
+When creating this app, I would like to test one input at a time and make sure that it works. 
+
+# Step 1: Define user interface (buttons, sliders, etc)
+
+Read in the training data.  
+
+Pull function: pulls a variable out of the data set. Sort of like a select but select ends up with a dataset. Pull will create a vector rather. 
+
+One thing that I can think of is adding a submit button, which ensures that the graph changes only when I click the button. 
+
+
+# Step 2: Adding static plots  
+
+To test if everything works until this point, I would love to add a static plot. In other words, we are not yet going to interact with the inputs. 
+
+We will be using the `plotOutput` function 
+
+
+# Step 3: adding interaction 
+
+If the previous step works, we will build an interactive plot that changes as we change our inputs. 
+
+
+# Step 4: choose variable 
+
+We will then decide what variables we can choose. In order to do this, we might need to convert into unquoted variable using this function: .data[[]]
+
+# Step 5: Add theme
+
+We can then finally choose a theme of our choice. 
+
+\
+\
+\
+
+
+
+## Coded Bias
+
+*Watch the [Code Bias](https://www.pbs.org/independentlens/films/coded-bias/) film and write a short reflection. If you want some prompts, reflect on: What part of the film impacted you the most? Was there a part that surprised you and why? What emotions did you experience while watching?*
+
+REMEMBER TO ADD YOUR GITHUB LINK AT THE TOP OF THE PAGE AND UNCOMMENT THE `knitr` OPTIONS.
+
+*What part of the film impacted you the most?* 
+
+I was kind of felt chills when Cathy was defining Machine learning. She says that Machine Learning is a scoring system that scores the probability of what you are about to do. She said there exists asymmetrical power and that it's all about who owns the code. There are people suffering algorithmic harm and yet there is no appeal system. This mainly happens because we think of AI as the one-solution to all and stop thinking about potential problems. Therefore, as data scientists, it is important to check and think of all potential biases that could arise.  
+
+Another interesting part of the film is that Machine Learning is still a black box to programmers. We still do not understand why and how certain algorithms produce that result, which could eventually bite us in the long run. Microsoft's Tay AI was also very impactful because it again showed how machine learning could go terribly wrong if AI is incorrectly used.  
+
+*Was there a part that surprised you and why?*
+
+Below are parts that surprised me: 
+
+In the UK, through the freedom of information campaign, they found that 98% of matches are incorrectly matching an innocent person as a wanted person. Also, when a man with his face partially covered got arrested, that was surprising to see how the government entities have been using AI incorrectly and against human rights.  
+
+Amazon resume: women applications were all rejected. This shows that the machine was simply replicating the world as it exists and we are not making any social progress. This shows that when we build our models we need to be mindful of what world we are trying to use.  
+
+When the teacher that used to earn every recognition was labeled as a bad teacher by the algorithm. 
+
+Usually, technology advocates are opposed to regulations. However, it was really interesting and surprising to see how some were for regulation. For example, Cathy was saying that the power of these machine learning tools are left unregulated and We need laws because no recourse. 
+
+
+
+*What emotions did you experience while watching?*
+
+As I was watching this film, I was slightly shocked, intimidated, and scared. Until now, technology was always a friendly tool for me that have made my life easier. However, through this video, I learned that these benefits come with costs and some people are affected more severely than others. It is very important to consider these problems and develop right regulations to ensure everyone is being treated somewhat fairly. I also leaned that we are being watched 24/7 and that technology provides and governments are not being transparent about it. 
+
+
+
+
+
+
