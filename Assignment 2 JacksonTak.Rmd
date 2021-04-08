@@ -44,6 +44,8 @@ From now on, GitHub should be part of your routine when doing assignments. I rec
 
 **Task**: When you are finished with the assignment, post a link below to the GitHub repo for the assignment. If you want to post it to your personal website, that's ok (not required). Make sure the link goes to a spot in the repo where I can easily find this assignment. For example, if you have a website with a blog and post the assignment as a blog post, link to the post's folder in the repo. As an example, I've linked to my GitHub stacking material [here](https://github.com/llendway/ads_website/tree/master/_posts/2021-03-22-stacking).
 
+Jackson's Link: https://github.com/jacksontak/assignment2
+
 ## Modeling
 
 Before jumping into these problems, you should read through (and follow along with!) the [model stacking](https://advanced-ds-in-r.netlify.app/posts/2021-03-22-stacking/) and [global model interpretation](https://advanced-ds-in-r.netlify.app/posts/2021-03-24-imlglobal/) tutorials on the Course Materials tab of the course website.
